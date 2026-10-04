@@ -24,12 +24,12 @@ Collect explicit feedback on the previous Claude response and emit an `llm_reque
    - `quality` = round(avg(correctness, relevance, factscore), 4)
    - `effectiveness` = round(avg(success, quality), 4)
 
-4. Read the session ID from the hook input context. If not available, read `.claude/active-user` to get the user ID for context.
+4. The session ID is available in the `CLAUDE_CODE_SESSION_ID` environment variable. Pass it as shown below.
 
 5. Emit the span:
    ```
    uv run --project ~/.claude/lib ~/.claude/lib/llm_feedback_emit.py \
-     --session-id "<session_id>" \
+     --session-id "$CLAUDE_CODE_SESSION_ID" \
      --success <success> \
      --correctness <correctness> \
      --relevance <relevance> \
