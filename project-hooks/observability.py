@@ -1,68 +1,59 @@
-"""OpenTelemetry setup
+"""OpenTelemetry metrics setup for project-level observability.
 
-Routes:
-  Traces → Tempo (OTLP/HTTP localhost:4318/v1/traces)
+Metrics → Prometheus (OTLP/HTTP localhost:4318/v1/metrics, via the collector).
+Set SERVICE_NAME to your project's name.
 """
 from __future__ import annotations
 
 from typing import Optional
 
-from opentelemetry import metrics, trace
+from opentelemetry import metrics
 from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+from opentelemetry.sdk.metrics import Counter, Histogram, MeterProvider
+from opentelemetry.sdk.metrics.export import AggregationTemporality, PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 OTLP_ENDPOINT = "http://localhost:4318"
-SERVICE_NAME = "myproject"
+SERVICE_NAME = "myproject"  # change to your project's name
 
-_tracer_provider: Optional[TracerProvider] = None
 _meter_provider: Optional[MeterProvider] = None
 
 
 def setup_telemetry(
     endpoint: str = OTLP_ENDPOINT,
     service_name: str = SERVICE_NAME,
-) -> tuple[TracerProvider, MeterProvider]:
-    global _tracer_provider, _meter_provider
+) -> MeterProvider:
+    global _meter_provider
 
-    resource = Resource.create({"service.name": service_name})
-
-    tp = TracerProvider(resource=resource)
-    tp.add_span_processor(
-        BatchSpanProcessor(OTLPSpanExporter(endpoint=f"{endpoint}/v1/traces"))
-    )
-    trace.set_tracer_provider(tp)
-    _tracer_provider = tp
+    # Fixed instance id so every short-lived run adds to the same metric series.
+    resource = Resource.create({"service.name": service_name, "service.instance.id": f"{service_name}_emit"})
 
     mp = MeterProvider(
         resource=resource,
         metric_readers=[
             PeriodicExportingMetricReader(
-                OTLPMetricExporter(endpoint=f"{endpoint}/v1/metrics"),
+                # Delta temporality: each run is a new process; the collector's
+                # deltatocumulative processor keeps the running totals.
+                OTLPMetricExporter(
+                    endpoint=f"{endpoint}/v1/metrics",
+                    preferred_temporality={
+                        Counter: AggregationTemporality.DELTA,
+                        Histogram: AggregationTemporality.DELTA,
+                    },
+                ),
                 export_interval_millis=10_000,
             )
         ],
     )
     metrics.set_meter_provider(mp)
     _meter_provider = mp
-
-    return tp, mp
-
-
-def get_tracer(name: str = "open_next_role") -> trace.Tracer:
-    return trace.get_tracer(name)
+    return mp
 
 
-def get_meter(name: str = "open_next_role") -> metrics.Meter:
+def get_meter(name: str = SERVICE_NAME) -> metrics.Meter:
     return metrics.get_meter(name)
 
 
 def shutdown_telemetry() -> None:
-    if _tracer_provider:
-        _tracer_provider.shutdown()
     if _meter_provider:
         _meter_provider.shutdown()

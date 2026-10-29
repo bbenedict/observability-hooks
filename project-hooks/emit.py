@@ -1,24 +1,25 @@
 """
-Emit spans to Tempo for myproject observability.
+Record project metrics to Prometheus (via the OTLP collector).
 
 Usage:
-  uv run python .claude/lib/emit.py span <operation> [key=value ...]
+  uv run python .claude/lib/emit.py metric <operation> [key=value ...]
 
-Span operations:
-  Any name you choose, in the form <project>.<operation>.
-  Attributes are key=value pairs. Numbers are sent as int, or as float if
-  the value contains a "."; everything else is sent as a string.
+Each numeric attribute becomes a histogram named <operation>.<attribute>; string
+attributes become labels. In Prometheus each histogram has _sum (total) and
+_count (number of runs), e.g. myproject_task_complete_items_sum.
 
-Example:
-  uv run python .claude/lib/emit.py span myproject.task.complete task=import items_processed=42 errors=0
+Examples:
+  myproject.task.complete   task= items_processed= errors= duration_s=
+  myproject.run.summary     run_id= success_rate= total_items=
+
+  uv run python .claude/lib/emit.py metric myproject.task.complete task=import items_processed=42 errors=0
 """
 
 import sys
-import time
 import os
 
 sys.path.insert(0, os.path.dirname(__file__))
-from observability import setup_telemetry, get_tracer, shutdown_telemetry
+from observability import setup_telemetry, get_meter, shutdown_telemetry
 
 
 def parse_attrs(args: list[str]) -> dict:
@@ -33,12 +34,19 @@ def parse_attrs(args: list[str]) -> dict:
     return attrs
 
 
-def emit_span(operation: str, attrs: dict) -> None:
+def record_metrics(operation: str, attrs: dict) -> None:
+    labels = {k: v for k, v in attrs.items() if isinstance(v, str)}
+    meter = get_meter()
+    for key, value in attrs.items():
+        if isinstance(value, (int, float)):
+            meter.create_histogram(f"{operation}.{key}").record(value, labels)
+
+
+def emit(operation: str, attrs: dict) -> None:
     setup_telemetry()
-    with get_tracer().start_as_current_span(operation, attributes=attrs):
-        time.sleep(0.05)
+    record_metrics(operation, attrs)
     shutdown_telemetry()
-    print(f"Span emitted: {operation} {attrs}")
+    print(f"Metric recorded: {operation} {attrs}")
 
 
 if __name__ == "__main__":
@@ -46,8 +54,8 @@ if __name__ == "__main__":
         print(__doc__)
         sys.exit(1)
 
-    if sys.argv[1] != "span":
-        print(f"Unknown mode: {sys.argv[1]}. Use 'span'.")
+    if sys.argv[1] != "metric":
+        print(f"Unknown mode: {sys.argv[1]}. Use 'metric'.")
         sys.exit(1)
 
-    emit_span(sys.argv[2], parse_attrs(sys.argv[3:]))
+    emit(sys.argv[2], parse_attrs(sys.argv[3:]))

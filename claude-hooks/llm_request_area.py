@@ -1,59 +1,55 @@
 """
 UserPromptSubmit hook: classifies the user's prompt across five areas and emits
-an llm_request_area span. Always fires. All five dimensions sum to 1.0.
+llm_request_area metrics. Always fires. All five dimensions sum to 1.0.
 
 Classification is sentence-level: each sentence gets one winning area, tallied
-across all sentences and normalized. This avoids fragment collision where common
-words like "right" or "search" create false signal outside their intended context.
+across all sentences and normalized.
+
+Design: "project" (the project's own domain work) is the DEFAULT — most prompts
+in any project are project work, and its vocabulary is unknowable in advance. The
+other areas are the identifiable exceptions, each with high-precision signals:
+  agentic  — working on Claude Code itself (.claude config, hooks, commands,
+             skills, subagents, memory, the telemetry tooling)
+  feedback — rating Claude's previous response
+  research — asking for outside information
+A sentence matching none of those is project work.
 """
 
 import json
 import re
 import sys
-import time
 from pathlib import Path
 
 
-
-# Signals per area. Prefer multi-word phrases — they carry enough context to
-# classify a sentence correctly even when individual words are ambiguous.
+# Signals for the three identifiable areas. "project" has no list — it is the
+# default. Prefer specific, unambiguous phrases: bare words like "hook", "skill",
+# "command", or "agent" also occur in ordinary software work (React hooks, a CLI
+# command parser, an app's skills screen) and would misread project work as
+# agentic, so they are deliberately excluded in favor of Claude-Code-specific
+# markers like ".claude", "settings.json", "slash command", and "subagent".
 SIGNALS: dict[str, list[str]] = {
-    # The project's own domain work — whatever the project exists to do —
-    # as opposed to working on the AI tooling (agentic), asking for outside
-    # information (research), or rating Claude (feedback).
-    "project": [
-        # Status / progress
-        "do i have", "where are we", "what's the status", "what is the status",
-        "status of", "what's left", "what's next", "next steps", "progress on",
-        "how many", "how far", "any open", "still open", "outstanding",
-        # Navigating existing work
-        "list the", "list all", "list my", "show me the", "show me my",
-        "open the", "where is the", "which ones", "the latest",
-        # Doing the work
-        "continue the", "resume the", "finish the", "pick up where",
-        "keep going", "run the", "run another", "start a new", "start the",
-        "next batch", "another batch", "process the", "work on",
-        "mark as", "mark it", "move it to", "close out",
-        # Changing project content
-        "update the", "edit the", "fix the", "add to the", "add a new",
-        "remove from", "delete the", "create the", "write the", "rename the",
-        "in the file", "in the folder", "the data", "the results",
-    ],
     "agentic": [
-        # Config and tooling
-        "hook", "hooks", "skill", "skills", "command", "commands",
-        "settings.json", ".claude/settings", "~/.claude",
+        # Claude Code config locations and files
+        ".claude", "claude code", "claude-code", "claude.md",
+        "settings.json", "settings.local.json", "~/.claude",
+        "agents.md", "claude's config", "claude config",
+        # Claude Code artifacts (specific phrasings)
+        "slash command", "slash commands", "subagent", "subagents",
         "global hook", "project hook", "hook fires", "hook runs",
-        # Code and scripts
-        "llm_request", "llm_feedback", "llm_request_area",
-        "observability", "telemetry", "otel", "opentelemetry",
-        "tempo", "grafana", "span", "emit span", "emit a span",
-        "pyproject", "venv", "uv run", "uv sync",
-        # AI system concepts
-        "memory", "agent", "agents", "slash command",
-        "configure", "configuration", "setup the", "install the",
-        "build it", "build a", "build the", "let's build",
-        "add a hook", "add the hook", "wire", "wiring",
+        "add a hook", "add the hook", "the hook in", "a stop hook",
+        "userpromptsubmit", "posttooluse", "pretooluse", "sessionstart",
+        "add a skill", "a claude skill", "the skill file",
+        "slash-command", "output style", "status line", "statusline",
+        "mcp server", "mcp tool", "mcp config",
+        # Auto memory
+        "auto memory", "memory file", "memory.md", "claude's memory",
+        # The telemetry / observability tooling itself
+        "llm_request", "llm_feedback", "llm_governance",
+        "observability", "telemetry", "opentelemetry", "otel",
+        "prometheus", "grafana", "tempo", "otlp", "collector config",
+        "emit metric", "emit a metric", "emit span", "deltatocumulative",
+        # The hook toolchain
+        "uv run", "uv sync", "pyproject", "the venv",
     ],
     "feedback": [
         # Explicit praise/criticism
@@ -86,6 +82,9 @@ SIGNALS: dict[str, list[str]] = {
     ],
 }
 
+# project is the default; other is retained for output compatibility (now rare).
+AREAS = ["project", "agentic", "feedback", "research", "other"]
+
 
 def split_sentences(text: str) -> list[str]:
     """Split text into sentences on . ? ! — keep short fragments as their own sentence."""
@@ -94,34 +93,39 @@ def split_sentences(text: str) -> list[str]:
 
 
 def classify_sentence(sentence: str) -> str:
-    """Return the best-matching area for a sentence, or 'other' if none match."""
+    """Priority gate. Almost everything is project or agentic; feedback and
+    research override only when clearly signalled (they generally are). 'other'
+    is reserved for a sentence with nothing to decide on.
+
+      1. clearly feedback?  -> feedback
+      2. clearly research?  -> research
+      3. a Claude Code marker present?  -> agentic
+      4. otherwise           -> project   (the default half of the main pair)
+    """
     t = sentence.lower().strip()
-    best_area = "other"
-    best_score = 0
-
-    for area, signals in SIGNALS.items():
-        score = sum(1 for sig in signals if sig in t)
-        if score > best_score:
-            best_score = score
-            best_area = area
-
-    return best_area
+    if not t:
+        return "other"
+    if any(sig in t for sig in SIGNALS["feedback"]):
+        return "feedback"
+    if any(sig in t for sig in SIGNALS["research"]):
+        return "research"
+    if any(sig in t for sig in SIGNALS["agentic"]):
+        return "agentic"
+    return "project"
 
 
 def score_prompt(text: str) -> dict[str, float]:
     sentences = split_sentences(text)
     if not sentences:
-        return {area: 0.0 for area in SIGNALS} | {"other": 1.0}
+        # Nothing to decide on.
+        return {area: (1.0 if area == "other" else 0.0) for area in AREAS}
 
-    tally: dict[str, int] = {area: 0 for area in SIGNALS}
-    tally["other"] = 0
-
+    tally: dict[str, int] = {area: 0 for area in AREAS}
     for sentence in sentences:
-        winner = classify_sentence(sentence)
-        tally[winner] += 1
+        tally[classify_sentence(sentence)] += 1
 
     total = len(sentences)
-    return {area: round(tally[area] / total, 4) for area in tally}
+    return {area: round(tally[area] / total, 4) for area in AREAS}
 
 
 def get_last_model(session_id: str) -> str:
@@ -142,23 +146,30 @@ def get_last_model(session_id: str) -> str:
     return "unknown"
 
 
-def emit_span(attrs: dict) -> None:
-    from opentelemetry import trace
-    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-    from opentelemetry.sdk.resources import Resource
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+def emit_metrics(scores: dict[str, float], model: str) -> None:
+    """Add each area's score to a counter labeled by area, for Prometheus.
 
-    resource = Resource.create({"service.name": "claude_code"})
-    tp = TracerProvider(resource=resource)
-    tp.add_span_processor(
-        BatchSpanProcessor(OTLPSpanExporter(endpoint="http://localhost:4318/v1/traces"))
+    Delta temporality: each hook run is a new process, so cumulative counters
+    would restart at 0 every time. The collector accumulates the deltas.
+    """
+    from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+    from opentelemetry.sdk.metrics import Counter, MeterProvider
+    from opentelemetry.sdk.metrics.export import AggregationTemporality, PeriodicExportingMetricReader
+    from opentelemetry.sdk.resources import Resource
+
+    # Fixed instance id so every hook run adds to the same series per area.
+    resource = Resource.create({"service.name": "claude_code", "service.instance.id": "llm_area_hook"})
+    exporter = OTLPMetricExporter(
+        endpoint="http://localhost:4318/v1/metrics",
+        preferred_temporality={Counter: AggregationTemporality.DELTA},
     )
-    trace.set_tracer_provider(tp)
-    tracer = trace.get_tracer("llm_area_hook")
-    with tracer.start_as_current_span("llm_request_area", attributes=attrs):
-        time.sleep(0.05)
-    tp.shutdown()
+    mp = MeterProvider(resource=resource, metric_readers=[PeriodicExportingMetricReader(exporter)])
+    counter = mp.get_meter("llm_area_hook").create_counter(
+        "llm_request_area_score", description="Prompt area score, summed per area"
+    )
+    for area, score in scores.items():
+        counter.add(score, {"area": area, "model": model})
+    mp.shutdown()
 
 
 if __name__ == "__main__":
@@ -175,17 +186,7 @@ if __name__ == "__main__":
     scores = score_prompt(prompt)
     model = get_last_model(session_id)
 
-    attrs = {
-        "session_id": session_id,
-        "model": model,
-        "project": scores["project"],
-        "agentic": scores["agentic"],
-        "feedback": scores["feedback"],
-        "research": scores["research"],
-        "other": scores["other"],
-    }
-
     try:
-        emit_span(attrs)
+        emit_metrics(scores, model)
     except Exception:
         pass

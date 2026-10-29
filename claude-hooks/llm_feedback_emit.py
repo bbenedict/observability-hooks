@@ -1,12 +1,11 @@
 """
-CLI helper: emits llm_request_feedback span with manual scores.
+CLI helper: emits llm_request_feedback metrics with manual scores.
 Called by the /llm-feedback skill.
 """
 
 import argparse
 import json
 import sys
-import time
 from pathlib import Path
 
 
@@ -29,23 +28,33 @@ def get_last_model(session_id: str) -> str:
     return "unknown"
 
 
-def emit_span(attrs: dict) -> None:
-    from opentelemetry import trace
-    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-    from opentelemetry.sdk.resources import Resource
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-    resource = Resource.create({"service.name": "claude_code"})
-    tp = TracerProvider(resource=resource)
-    tp.add_span_processor(
-        BatchSpanProcessor(OTLPSpanExporter(endpoint="http://localhost:4318/v1/traces"))
+
+def emit_metrics(attrs: dict) -> None:
+    """Record each feedback score present as a Prometheus histogram (_sum and _count per score).
+
+    Delta temporality: each run is a new process; the collector's
+    deltatocumulative processor keeps the running totals.
+    """
+    from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+    from opentelemetry.sdk.metrics import Counter, Histogram, MeterProvider
+    from opentelemetry.sdk.metrics.export import AggregationTemporality, PeriodicExportingMetricReader
+    from opentelemetry.sdk.resources import Resource
+
+    # Fixed instance id so every hook run adds to the same series.
+    resource = Resource.create({"service.name": "claude_code", "service.instance.id": "llm_feedback_emit"})
+    exporter = OTLPMetricExporter(
+        endpoint="http://localhost:4318/v1/metrics",
+        preferred_temporality={Counter: AggregationTemporality.DELTA, Histogram: AggregationTemporality.DELTA},
     )
-    trace.set_tracer_provider(tp)
-    tracer = trace.get_tracer("llm_feedback_emit")
-    with tracer.start_as_current_span("llm_request_feedback", attributes=attrs):
-        time.sleep(0.05)
-    tp.shutdown()
+    mp = MeterProvider(resource=resource, metric_readers=[PeriodicExportingMetricReader(exporter)])
+    meter = mp.get_meter("llm_feedback_emit")
+    labels = {"model": attrs["model"], "signal_type": attrs["signal_type"]}
+    scores = meter.create_histogram("llm_request_feedback_score", description="Feedback score (0-1), by score")
+    for score in ("success", "correctness", "relevance", "factscore", "quality", "effectiveness"):
+        if attrs.get(score) is not None:
+            scores.record(attrs[score], {**labels, "score": score})
+    mp.shutdown()
 
 
 if __name__ == "__main__":
@@ -74,7 +83,7 @@ if __name__ == "__main__":
     }
 
     try:
-        emit_span(attrs)
+        emit_metrics(attrs)
         print(json.dumps({"status": "ok", "effectiveness": args.effectiveness, "quality": args.quality}))
     except Exception as e:
         print(json.dumps({"status": "error", "message": str(e)}), file=sys.stderr)

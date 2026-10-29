@@ -1,6 +1,6 @@
 # llm-feedback
 
-Collect explicit feedback on the previous Claude response and emit an `llm_request_feedback` span to Tempo.
+Collect explicit feedback on the previous Claude response and record an `llm_request_feedback` metric to Prometheus.
 
 ## Steps
 
@@ -26,7 +26,7 @@ Collect explicit feedback on the previous Claude response and emit an `llm_reque
 
 4. The session ID is available in the `CLAUDE_CODE_SESSION_ID` environment variable. Pass it as shown below.
 
-5. Emit the span:
+5. Record the metric:
    ```
    uv run --project ~/.claude/lib ~/.claude/lib/llm_feedback_emit.py \
      --session-id "$CLAUDE_CODE_SESSION_ID" \
